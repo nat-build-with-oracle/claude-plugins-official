@@ -87,8 +87,8 @@ hear #media-team without a tag, and never read #บัญชี:
 ```yaml
 access:
   groups:
-    "1560861042622472343": { requireMention: false }
-    "1560860812602511472": { deny: true }
+    "<channel-id>": { requireMention: false }
+    "<other-channel-id>": { deny: true }
 ```
 
 ## Concerns and open questions
