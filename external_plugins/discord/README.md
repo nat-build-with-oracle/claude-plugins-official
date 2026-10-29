@@ -109,3 +109,7 @@ Downloads land in `~/.claude/channels/discord/inbox/`.
 
 Same path for attachments on historical messages found via `fetch_messages`
 (messages with attachments are marked `+Natt`).
+
+## laris-co patch (this fork)
+
+This fork carries the laris-co patch to `server.ts` (guild default policy, roll call, joined/kicked threads, `!here`, own-thread, history backfill, room forward). What it changes and why: [LARIS-CO-PATCH.md](LARIS-CO-PATCH.md); the full diff against upstream 0.0.4: [laris-co.patch](laris-co.patch). The plugin LICENSE is unchanged.

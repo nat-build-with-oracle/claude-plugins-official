@@ -68,7 +68,7 @@ if (!TOKEN) {
   )
   // laris-co patch: connect as an empty server instead of exiting. An exit marks plugin:discord:discord
   // as failed in ~/.claude/mcp-needs-auth-cache.json, and that cache is global: every session started
-  // in the next 15 minutes skips Discord, even the ones that have a token (Athena, 2026-10-17).
+  // in the next 15 minutes skips Discord, even the ones that have a token (2026-10-17).
   const idle = new Server({ name: 'discord', version: '0.0.0' }, { capabilities: { tools: {} } })
   idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
   await idle.connect(new StdioServerTransport())

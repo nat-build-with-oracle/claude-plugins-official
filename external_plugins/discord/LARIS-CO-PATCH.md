@@ -57,8 +57,8 @@ a prior hand patch it knows about, or already ours. Anything else it leaves alon
   or an exact `session:pane`), `answerAs` = the oracle's bot, and `answerMention` = its `owner`. The body
   answers with `BOT=<oracle> just say`. `just room-map <name>` posts and pins a map in the oracle's main
   channel showing thread → body → status, and edits that same message on later runs.
-- `answerCmd` (set by access-sync): the full send-only command (`BOT=<bot> <laris-team>/tools/discord-say.sh`),
-  so a forwarded body in another repo (neo-oracle, calliope-oracle) can answer without the laris-team justfile.
+- `answerCmd` (set by access-sync): the full send-only command (`BOT=<bot> <team-repo>/tools/discord-say.sh`),
+  so a forwarded body in another repo (another oracle repo) can answer without the team repo justfile.
 - `roleCall: [<role id>]`: a message from an `allowFrom` user that tags one of these roles (Laris Co: All Oracles)
   reaches the bot in any room, even one its policy denies, and the bot may answer in that room. A bot that is not
   running does not answer: a roll call never wakes a sleeping bot.
@@ -96,9 +96,9 @@ access:
 - **Plugin updates overwrite the cache.** After an update, `just plugin-patch check` reports UNKNOWN.
   Copy the new upstream into `upstream-<ver>/`, re-apply `laris-co.patch` to it, and commit.
 - **One body per bot.** Only the main checkout runs `--channels`. A worktree never connects as the bot.
-  If a worktree should get only some of the work, route a thread to it (`maw atlas route` / `team-threads`)
+  If a worktree should get only some of the work, route a thread to it (with your own routing tool)
   instead of giving it an `access.json`.
-- **Every machine needs the patch.** A bot on white runs white's plugin cache. If it is unpatched, it ignores
+- **Every machine needs the patch.** A bot on another machine runs that machine's plugin cache. If it is unpatched, it ignores
   `guilds` and listens only in the rooms listed in `groups`.
 - **Threads someone else opened** (by Nat, or by another bot) still need a tag on each message. Should a bot
   keep listening in a thread once it has been tagged there? Not decided.
@@ -110,13 +110,13 @@ access:
   `DISCORD_BOT_TOKEN`. Every session without a bot (worktrees, oracles with no bot) then records
   `plugin:discord:discord` as failed in the global `~/.claude/mcp-needs-auth-cache.json`, and for 15
   minutes every new session skips Discord, bots too. The patch makes a token-less session connect as an
-  empty server with no tools. Found by Athena.
+  empty server with no tools.
 - **A plugin that fails once stays off for 15 minutes.** Claude Code records the failure in
   `~/.claude/mcp-needs-auth-cache.json` and skips `plugin:discord:discord` until it expires. If a bot is
   silent after a restart, delete that entry (or run `/mcp` and reconnect) before you look elsewhere.
-  Found by Athena.
+ 
 - **Token resets: verify before use.** After a reset, the token read from the page is not always the newest
-  one. Check it with `GET /users/@me` (`maw atlas whoami`) before you launch the body.
+  one. Check it with `GET /users/@me`  before you launch the body.
 - **Bots ignore bots** (upstream rule). Oracles cannot tag each other into a thread over Discord. They use
   `maw hey` / herdr for that.
 - **Untyped access.** The patch reads `ownerId` and `guildId` off the channel at runtime. It builds with

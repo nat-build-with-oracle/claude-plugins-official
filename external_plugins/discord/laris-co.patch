@@ -1,0 +1,585 @@
+--- plugin/discord/upstream-0.0.4/server.ts	2026-10-17 12:16:48
++++ plugin/discord/server.ts	2026-10-21 09:48:38
+@@ -22,6 +22,7 @@
+   GatewayIntentBits,
+   Partials,
+   ChannelType,
++  MessageType,
+   ButtonBuilder,
+   ButtonStyle,
+   ActionRowBuilder,
+@@ -30,12 +31,19 @@
+   type Interaction,
+ } from 'discord.js'
+ import { randomBytes } from 'crypto'
++import { spawnSync } from 'child_process'
+ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+ import { homedir } from 'os'
+ import { join, sep } from 'path'
+ 
+ const STATE_DIR = process.env.DISCORD_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'discord')
+ const ACCESS_FILE = join(STATE_DIR, 'access.json')
++// laris-co patch: per-room answer mode set from chat with "!thread on|off". Survives restarts.
++const MODES_FILE = join(STATE_DIR, 'modes.json')
++// laris-co patch: threads this bot joined through a roll call. Saved, so they survive restarts.
++const JOINED_FILE = join(STATE_DIR, 'joined.json')
++// laris-co patch: threads this bot was kicked from (member list removal or "!kick @Bot"). Saved too.
++const KICKED_FILE = join(STATE_DIR, 'kicked.json')
+ const APPROVED_DIR = join(STATE_DIR, 'approved')
+ const ENV_FILE = join(STATE_DIR, '.env')
+ 
+@@ -55,11 +63,23 @@
+ 
+ if (!TOKEN) {
+   process.stderr.write(
+-    `discord channel: DISCORD_BOT_TOKEN required\n` +
+-    `  set in ${ENV_FILE}\n` +
+-    `  format: DISCORD_BOT_TOKEN=MTIz...\n`,
++    `discord channel: no DISCORD_BOT_TOKEN, so this session is not a Discord body. Serving no tools.\n` +
++    `  to make it one: set it in ${ENV_FILE} or on the launch line\n`,
+   )
+-  process.exit(1)
++  // laris-co patch: connect as an empty server instead of exiting. An exit marks plugin:discord:discord
++  // as failed in ~/.claude/mcp-needs-auth-cache.json, and that cache is global: every session started
++  // in the next 15 minutes skips Discord, even the ones that have a token (2026-10-17).
++  const idle = new Server({ name: 'discord', version: '0.0.0' }, { capabilities: { tools: {} } })
++  idle.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }))
++  await idle.connect(new StdioServerTransport())
++  // The shutdown handlers further down are never reached from this branch, so register them here.
++  // Without them bun spins at ~99% CPU on the closed stdin after Claude exits (homekeeper, 2026-10-21).
++  const bye = () => process.exit(0)
++  process.stdin.on('end', bye)
++  process.stdin.on('close', bye)
++  process.on('SIGTERM', bye)
++  process.on('SIGINT', bye)
++  await new Promise(() => {})
+ }
+ const INBOX_DIR = join(STATE_DIR, 'inbox')
+ 
+@@ -100,13 +120,37 @@
+ type GroupPolicy = {
+   requireMention: boolean
+   allowFrom: string[]
++  /** laris-co patch: on a mention in a plain channel, open a thread on that message and answer there. */
++  threadOnMention?: boolean
++  /** laris-co patch: never listen here, even when the guild default would. */
++  deny?: boolean
++  /** laris-co patch: hand this room's messages to a herdr agent: a worktree path (matched on cwd, in any
++   *  running herdr session) or an exact "session:pane". */
++  forwardTo?: string
++  /** laris-co patch: the bot the forwarded body answers as (tells it which BOT= to use with `just say`). */
++  answerAs?: string
++  /** laris-co patch: a user id the forwarded body tags in every answer (the oracle's owner). */
++  answerMention?: string
++  /** laris-co patch: full send-only command for the forwarded body (works from any repo). */
++  answerCmd?: string
++  /** laris-co patch: on a tag, read back up to N messages (stopping at this bot's last reply) into meta.context. 0 = off. */
++  historyBackfill?: number
+ }
+ 
+ type Access = {
+   dmPolicy: 'pairing' | 'allowlist' | 'disabled'
++  /** laris-co patch: the host oracle of this guild (written by access-sync). Only the host acts on "!!thread". */
++  host?: boolean
+   allowFrom: string[]
+   /** Keyed on channel ID (snowflake), not guild ID. One entry per guild channel. */
+   groups: Record<string, GroupPolicy>
++  /** laris-co patch: keyed on guild ID. Default policy for every channel in that guild not listed in groups. */
++  guilds?: Record<string, GroupPolicy>
++  /** laris-co patch: "!here" unlock words and idle timeout. Defaults: !here / !lock / 10 minutes. */
++  here?: { unlock?: string; lock?: string; idleMinutes?: number }
++  /** laris-co patch: role ids that work as a roll call. A message from an allowFrom user that tags one of
++   *  these roles reaches this bot in any room, even one its policy closes, and the bot may answer there. */
++  roleCall?: string[]
+   pending: Record<string, PendingEntry>
+   mentionPatterns?: string[]
+   // delivery/UX config — optional, defaults live in the reply handler
+@@ -156,6 +200,10 @@
+       dmPolicy: parsed.dmPolicy ?? 'pairing',
+       allowFrom: parsed.allowFrom ?? [],
+       groups: parsed.groups ?? {},
++      guilds: parsed.guilds,
++      host: parsed.host,
++      here: parsed.here,
++      roleCall: parsed.roleCall,
+       pending: parsed.pending ?? {},
+       mentionPatterns: parsed.mentionPatterns,
+       ackReaction: parsed.ackReaction,
+@@ -233,6 +281,246 @@
+   }
+ }
+ 
++// Find the access policy for a channel.
++// A thread can be allowed by its own id; otherwise it falls back to its parent.
++function findGroupPolicy(
++  access: Access,
++  channel: { id: string; isThread(): boolean; parentId?: string | null; guildId?: string | null },
++): GroupPolicy | undefined {
++  // 1. Is this channel (or thread) allowed by its own id?
++  const ownPolicy = access.groups[channel.id]
++  if (ownPolicy) {
++    return ownPolicy.deny ? undefined : ownPolicy
++  }
++
++  // 2. A thread falls back to its parent channel.
++  const parentChannelId = channel.isThread() ? channel.parentId : null
++  const parentPolicy = parentChannelId ? access.groups[parentChannelId] : undefined
++  if (parentPolicy) {
++    return parentPolicy.deny ? undefined : parentPolicy
++  }
++
++  // 3. laris-co patch: anything else falls back to the guild default.
++  const guildPolicy = channel.guildId ? access.guilds?.[channel.guildId] : undefined
++  return guildPolicy?.deny ? undefined : guildPolicy
++}
++
++// laris-co patch: a thread this bot opened answers without a fresh tag.
++function isOwnThread(channel: { isThread(): boolean; ownerId?: string | null }): boolean {
++  return channel.isThread() && !!client.user && channel.ownerId === client.user.id
++}
++
++// laris-co patch: "!here" unlocks a room like a phone screen. While unlocked the bot answers inline
++// and hears every allowed message without a tag. Each message resets the idle timer; when it runs
++// out (default 10 min, "!here 30m" for longer) or someone says "!lock", the room locks again.
++// Kept in memory only: a restart locks every room.
++const unlocked = new Map<string, { until: number; idleMs: number }>()
++
++function isUnlocked(channelId: string, touch = false): boolean {
++  const u = unlocked.get(channelId)
++  if (!u) return false
++  if (Date.now() > u.until) {
++    unlocked.delete(channelId)
++    return false
++  }
++  if (touch) u.until = Date.now() + u.idleMs
++  return true
++}
++
++function hereCommand(msg: Message, access: Access): { kind: 'unlock' | 'lock'; idleMs: number } | null {
++  const unlockWord = (access.here?.unlock ?? '!here').toLowerCase()
++  const lockWord = (access.here?.lock ?? '!lock').toLowerCase()
++  const text = msg.content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase()
++  const idleMs = (access.here?.idleMinutes ?? 10) * 60_000
++  if (text === lockWord || text.startsWith(lockWord + ' ')) return { kind: 'lock', idleMs }
++  if (text === unlockWord || text.startsWith(unlockWord + ' ')) {
++    const m = /^\S+\s+(\d+)\s*(m|min|h|hr)\b/.exec(text)
++    return { kind: 'unlock', idleMs: m ? Number(m[1]) * (m[2]!.startsWith('h') ? 3_600_000 : 60_000) : idleMs }
++  }
++  return null
++}
++
++// laris-co patch: history backfill, the Hermes way. Read back from the tag until this bot's own
++// last message (where its previous turn ended) or `limit` messages, oldest first, one line each.
++// Senders not on the allowlist are marked [unverified]. Goes in meta, so a sender cannot forge it.
++async function historyBackfill(msg: Message, limit: number, allowed: string[]): Promise<string> {
++  if (!('messages' in msg.channel)) return ''
++  try {
++    const got = await msg.channel.messages.fetch({ before: msg.id, limit: Math.min(limit, 100) })
++    const lines: string[] = []
++    for (const m of got.values()) {               // newest first
++      if (m.author.id === client.user?.id) break   // our last turn: stop here
++      if (client.user && m.mentions.has(client.user)) break   // the last tag: its answer went to a thread
++      const text = (m.cleanContent || (m.attachments.size ? '(attachment)' : '')).replace(/\s+/g, ' ').slice(0, 300)
++      if (!text) continue
++      const tag = m.author.bot ? ' [bot]' : allowed.includes(m.author.id) ? '' : ' [unverified]'
++      lines.push(`[${m.author.username}${tag}] ${text}`)
++    }
++    return lines.reverse().join('\n')
++  } catch {
++    return ''
++  }
++}
++
++// laris-co patch: answer mode per room. "thread" = answers go in a thread on the message,
++// "inline" = answer in the room. Chat toggle wins; otherwise the policy's threadOnMention.
++function readModes(): Record<string, 'thread' | 'inline'> {
++  try { return JSON.parse(readFileSync(MODES_FILE, 'utf8')) } catch { return {} }
++}
++
++function threadMode(channelId: string, policy: GroupPolicy | undefined): boolean {
++  const set = readModes()[channelId]
++  return set ? set === 'thread' : !!policy?.threadOnMention
++}
++
++function setMode(channelId: string, mode: 'thread' | 'inline'): void {
++  const modes = readModes()
++  modes[channelId] = mode
++  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
++  writeFileSync(MODES_FILE, JSON.stringify(modes, null, 1) + '\n', { mode: 0o600 })
++}
++
++// "!thread on" / "!thread off" set the mode; "!thread <name>" opens a thread called <name> on that message.
++function threadCommand(msg: Message): 'thread' | 'inline' | { name: string } | null {
++  const text = msg.content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim()
++  const low = text.toLowerCase()
++  if (low === '!thread on') return 'thread'
++  if (low === '!thread off') return 'inline'
++  const m = /^!thread\s+(.+)$/i.exec(text)
++  if (m) return { name: m[1]!.slice(0, 90) }
++  return low === '!thread' ? { name: '' } : null   // bare: placeholder name, the agent renames it
++}
++
++// laris-co patch: a room can belong to a worktree body of this oracle. The gateway stays here (one
++// listener, no double answers). The message is typed into the herdr agent running in that worktree,
++// and the worktree answers through a send-only tool (tools/discord-say.sh). Returns false when no agent
++// runs there, and then the message is delivered here as usual.
++function findForwardTarget(herdr: string, target: string): { session: string; pane: string } | null {
++  // "session:pane", e.g. "neo:w1:p1"
++  if (!target.includes('/')) {
++    const i = target.indexOf(':')
++    return i > 0 ? { session: target.slice(0, i), pane: target.slice(i + 1) } : null
++  }
++  // a path: our own session first, then every running session
++  const own = process.env.HERDR_SESSION
++  const sessions = spawnSync(herdr, ['session', 'list'], { encoding: 'utf8', timeout: 5000 }).stdout
++    .split('\n').map(l => l.trim().split(/\s+/)).filter(c => c[1] === 'running').map(c => c[0]!)
++  for (const s of [...(own ? [own] : []), ...sessions.filter(s => s !== own)]) {
++    const list = spawnSync(herdr, ['--session', s, 'agent', 'list'], { encoding: 'utf8', timeout: 5000 })
++    try {
++      const agents = JSON.parse(list.stdout).result.agents as { pane_id: string; cwd?: string }[]
++      const hit = agents.find(a => a.cwd === target)
++      if (hit) return { session: s, pane: hit.pane_id }
++    } catch {}
++  }
++  return null
++}
++
++function forwardToWorktree(msg: Message, policy: GroupPolicy, chatId: string): boolean {
++  const herdr = process.env.HERDR_BIN_PATH || 'herdr'
++  const to = findForwardTarget(herdr, policy.forwardTo!)
++  if (!to) return false
++  const room = 'name' in msg.channel && msg.channel.name ? `#${msg.channel.name}` : chatId
++  const atts = msg.attachments.size ? ` (+${msg.attachments.size} attachment)` : ''
++  const tag = policy.answerMention ? `<@${policy.answerMention}> ` : ''
++  const say = policy.answerCmd ?? (policy.answerAs ? `BOT=${policy.answerAs} just say` : '')
++  const as = say ? ` · answer: ${say} ${chatId} "${tag}<text>" (typing: ${say.replace(/discord-say\.sh$/, 'discord-say.sh --typing')} ${chatId})` : ''
++  const line = `[discord ${room} · ${msg.author.username} · chat_id ${chatId} · message_id ${msg.id}${as}] ${msg.content}${atts}`
++  const sent = spawnSync(herdr, ['--session', to.session, 'agent', 'prompt', to.pane, line], { encoding: 'utf8', timeout: 10000 })
++  return sent.status === 0
++}
++
++// laris-co patch: threads opened by a bare "!thread": the agent is asked to give them a real name.
++const newThreads = new Set<string>()
++
++// laris-co patch: roll call. Rooms where a roll call reached us may be answered in, for this run.
++const rollCallRooms = new Set<string>()
++
++// laris-co patch: a roll call inside a THREAD joins it: from then on every message there from an allowFrom
++// user reaches this bot, no tag needed, until someone says "!leave" in it.
++function readJoined(): string[] {
++  try { return JSON.parse(readFileSync(JOINED_FILE, 'utf8')) } catch { return [] }
++}
++function setJoined(id: string, on: boolean): void {
++  const s = new Set(readJoined())
++  if (on) s.add(id); else s.delete(id)
++  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
++  writeFileSync(JOINED_FILE, JSON.stringify([...s]) + '\n', { mode: 0o600 })
++}
++
++// laris-co patch: a kick beats every other way in (thread id, parent channel, guild default, joined).
++function readKicked(): string[] {
++  try { return JSON.parse(readFileSync(KICKED_FILE, 'utf8')) } catch { return [] }
++}
++function setKicked(id: string, on: boolean): void {
++  const s = new Set(readKicked())
++  if (on) s.add(id); else s.delete(id)
++  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
++  writeFileSync(KICKED_FILE, JSON.stringify([...s]) + '\n', { mode: 0o600 })
++}
++
++// Returns a gate result when the message is about kicking this bot in a thread, else null.
++function kickGate(msg: Message, access: Access): GateResult | null {
++  if (!msg.channel.isThread() || !client.user) return null
++  const me = client.user.id
++  const id = msg.channelId
++  const human = access.allowFrom.includes(msg.author.id)
++  const aboutMe = msg.mentions.users.has(me)
++  const text = msg.content.trim().toLowerCase()
++  // a human removes this bot from the thread's member list (Discord posts a "removed X from the thread" message)
++  if (human && aboutMe && msg.type === MessageType.RecipientRemove) {
++    setKicked(id, true); setJoined(id, false)
++    return { action: 'drop' }
++  }
++  // added back to the member list: welcome back (it hears the thread again through its normal access)
++  if (human && aboutMe && msg.type === MessageType.RecipientAdd) {
++    setKicked(id, false)
++    return { action: 'drop' }
++  }
++  // "!kick @Bot [@Bot…]": the tagged bots leave the member list and stop hearing this thread
++  if (human && aboutMe && text.startsWith('!kick')) {
++    setKicked(id, true); setJoined(id, false)
++    void msg.react('👋').catch(() => {})
++    void (msg.channel as any).members?.remove?.(me).catch(() => {})
++    return { action: 'drop' }
++  }
++  // "!join @Bot": undo a kick and join the thread
++  if (human && aboutMe && text.startsWith('!join')) {
++    setKicked(id, false); setJoined(id, true)
++    void msg.react('👋').catch(() => {})
++    return { action: 'drop' }
++  }
++  if (readKicked().includes(id) && !isRollCall(msg, access)) return { action: 'drop' }
++  return null
++}
++
++function isRollCall(msg: Message, access: Access): boolean {
++  const roles = access.roleCall ?? []
++  if (!roles.length || !access.allowFrom.includes(msg.author.id)) return false
++  const mine = msg.guild?.members.me?.roles.cache
++  return roles.some(r => msg.mentions.roles.has(r) && (!mine || mine.has(r)))
++}
++
++// laris-co patch: open (or join) a thread on the triggering message and return its id.
++// Two bots tagged in one message race here; the loser finds the winner's thread.
++async function threadFor(msg: Message): Promise<string | null> {
++  const name = (msg.cleanContent || `${msg.author.username} asks`)
++    .replace(/\s+/g, ' ').trim().slice(0, 90) || `${msg.author.username} asks`
++  try {
++    const thread = await msg.startThread({ name, autoArchiveDuration: 1440 })
++    return thread.id
++  } catch {
++    for (let i = 0; i < 3; i++) {
++      try {
++        const fresh = await msg.fetch(true)
++        if (fresh.thread) return fresh.thread.id
++      } catch {}
++      await new Promise(r => setTimeout(r, 700))
++    }
++    return null
++  }
++}
++
+ async function gate(msg: Message): Promise<GateResult> {
+   const access = loadAccess()
+   const pruned = pruneExpired(access)
+@@ -274,19 +562,41 @@
+   }
+ 
+   // We key on channel ID (not guild ID) — simpler, and lets the user
+-  // opt in per-channel rather than per-server. Threads inherit their
+-  // parent channel's opt-in; the reply still goes to msg.channelId
+-  // (the thread), this is only the gate lookup.
+-  const channelId = msg.channel.isThread()
+-    ? msg.channel.parentId ?? msg.channelId
+-    : msg.channelId
+-  const policy = access.groups[channelId]
++  // opt in per-channel rather than per-server. A thread can be opted in
++  // by its own ID; otherwise it inherits its parent channel's opt-in.
++  // laris-co patch: a roll call (@All Oracles) from a trusted human reaches every awake bot in any room.
++  const kicked = kickGate(msg, access)
++  if (kicked) return kicked
++  if (isRollCall(msg, access)) {
++    rollCallRooms.add(msg.channelId)
++    if (msg.channel.isThread()) { setJoined(msg.channelId, true); setKicked(msg.channelId, false) }
++    return { action: 'deliver', access }
++  }
++  if (readJoined().includes(msg.channelId) && access.allowFrom.includes(msg.author.id)) {
++    const text = msg.content.trim().toLowerCase()
++    if (text === '!leave') {
++      setJoined(msg.channelId, false)
++      void msg.react('👋').catch(() => {})
++      return { action: 'drop' }
++    }
++    // "!kick @Bot [@Bot…]": only the tagged bots leave this thread; the others stay and stay quiet
++    if (text.startsWith('!kick')) {
++      if (client.user && msg.mentions.users.has(client.user.id)) {
++        setJoined(msg.channelId, false)
++        void msg.react('👋').catch(() => {})
++      }
++      return { action: 'drop' }
++    }
++    return { action: 'deliver', access }
++  }
++  const policy = findGroupPolicy(access, msg.channel)
+   if (!policy) return { action: 'drop' }
+   const groupAllowFrom = policy.allowFrom ?? []
+-  const requireMention = policy.requireMention ?? true
++  const requireMention = isOwnThread(msg.channel) ? false : (policy.requireMention ?? true)
+   if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
+     return { action: 'drop' }
+   }
++  if (isUnlocked(msg.channelId, true)) return { action: 'deliver', access }
+   if (requireMention && !(await isMentioned(msg, access.mentionPatterns))) {
+     return { action: 'drop' }
+   }
+@@ -409,8 +719,8 @@
+     const userId = ch.recipientId ?? dmChannelUsers.get(id)
+     if (userId && access.allowFrom.includes(userId)) return ch
+   } else {
+-    const key = ch.isThread() ? ch.parentId ?? ch.id : ch.id
+-    if (key in access.groups) return ch
++    if (findGroupPolicy(access, ch)) return ch
++    if (rollCallRooms.has(id) || readJoined().includes(id)) return ch   // laris-co patch: roll call / joined thread
+   }
+   throw new Error(`channel ${id} is not allowlisted — add via /discord:access`)
+ }
+@@ -568,6 +878,18 @@
+       },
+     },
+     {
++      name: 'rename_thread',
++      description: 'Rename a Discord thread (laris-co patch). Use it to give a thread opened by a bare "!thread" a short, meaningful name taken from the conversation (max 90 chars).',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          chat_id: { type: 'string', description: 'the thread id' },
++          name: { type: 'string' },
++        },
++        required: ['chat_id', 'name'],
++      },
++    },
++    {
+       name: 'download_attachment',
+       description: 'Download attachments from a specific Discord message to the local inbox. Use after fetch_messages shows a message has attachments (marked with +Natt). Returns file paths ready to Read.',
+       inputSchema: {
+@@ -605,12 +927,23 @@
+       case 'reply': {
+         const chat_id = args.chat_id as string
+         const text = args.text as string
+-        const reply_to = args.reply_to as string | undefined
++        let reply_to = args.reply_to as string | undefined
+         const files = (args.files as string[] | undefined) ?? []
+ 
+-        const ch = await fetchAllowedChannel(chat_id)
++        let ch = await fetchAllowedChannel(chat_id)
+         if (!('send' in ch)) throw new Error('channel is not sendable')
+ 
++        // laris-co patch: answering one message in a plain channel opens a thread on it and answers there.
++        if (reply_to && ch.type !== ChannelType.DM && !ch.isThread() && 'messages' in ch && !isUnlocked(ch.id)
++            && threadMode(ch.id, findGroupPolicy(loadAccess(), ch))) {
++          const target = await ch.messages.fetch(reply_to).catch(() => null)
++          const threadId = target ? await threadFor(target) : null
++          if (threadId) {
++            ch = await fetchTextChannel(threadId)
++            reply_to = undefined
++          }
++        }
++
+         for (const f of files) {
+           assertSendable(f)
+           const st = statSync(f)
+@@ -689,6 +1022,14 @@
+         const edited = await msg.edit(args.text as string)
+         return { content: [{ type: 'text', text: `edited (id: ${edited.id})` }] }
+       }
++      case 'rename_thread': {
++        const ch = await fetchAllowedChannel(args.chat_id as string)
++        if (!('isThread' in ch) || !ch.isThread()) throw new Error('not a thread')
++        const name = String(args.name).replace(/\s+/g, ' ').trim().slice(0, 90)
++        await ch.setName(name)
++        newThreads.delete(ch.id)
++        return { content: [{ type: 'text', text: `renamed thread ${ch.id} to "${name}"` }] }
++      }
+       case 'download_attachment': {
+         const ch = await fetchAllowedChannel(args.chat_id as string)
+         const msg = await ch.messages.fetch(args.message_id as string)
+@@ -824,7 +1165,85 @@
+     return
+   }
+ 
+-  const chat_id = msg.channelId
++  let chat_id = msg.channelId
++  // laris-co patch: read these before "!here" or a new thread changes the picture.
++  const roomPolicy = msg.channel.type !== ChannelType.DM ? findGroupPolicy(result.access, msg.channel) : undefined
++  const tagged = !!roomPolicy && await isMentioned(msg, result.access.mentionPatterns)
++
++  // laris-co patch: rooms owned by a worktree body go there, not here.
++  if (msg.channel.type !== ChannelType.DM) {
++    const owner = findGroupPolicy(result.access, msg.channel)
++    if (owner?.forwardTo && forwardToWorktree(msg, owner, msg.channelId)) {
++      void msg.react('📨').catch(() => {})
++      // the worktree body is thinking now: show typing in the room (~10s; it can renew with `just typing`)
++      if ('sendTyping' in msg.channel) void msg.channel.sendTyping().catch(() => {})
++      return
++    }
++  }
++
++  // laris-co patch: "!!<name>" (or "!!thread <name>") = a standalone public thread in this channel (in the parent when typed
++  // inside a thread), opened by the HOST only, with every trusted human added as a member. Other bots ignore it.
++  if (msg.channel.type !== ChannelType.DM) {
++    const m = /^!!(?:thread\s+)?([^\s!].*)$/i.exec(msg.content.replace(/<@[!&]?\d+>/g, ' ').replace(/\s+/g, ' ').trim())
++    if (m) {
++      if (!result.access.host) return
++      const parent: any = msg.channel.isThread() ? (msg.channel as any).parent : msg.channel
++      try {
++        const th = await parent.threads.create({ name: m[1]!.slice(0, 90), autoArchiveDuration: 10080, type: ChannelType.PublicThread })
++        for (const uid of result.access.allowFrom) await th.members.add(uid).catch(() => {})
++        await th.send(`🧵 **${th.name}** · opened by <@${msg.author.id}>`).catch(() => {})
++        void msg.react('🧵').catch(() => {})
++        void msg.reply({ content: `🧵 <#${th.id}>`, allowedMentions: { parse: [] } }).catch(() => {})
++      } catch (e) {
++        void msg.react('⚠️').catch(() => {})
++        process.stderr.write(`discord: !!thread failed: ${e}\n`)
++      }
++      return
++    }
++  }
++
++  // laris-co patch: "!thread on|off" switches this room's answer mode.
++  if (msg.channel.type !== ChannelType.DM && !msg.channel.isThread()) {
++    const mode = threadCommand(msg)
++    if (mode === 'thread' || mode === 'inline') {
++      setMode(msg.channelId, mode)
++      void msg.react(mode === 'thread' ? '🧵' : '💬').catch(() => {})
++      return
++    }
++    if (mode) {
++      // a named thread on this message; the message itself then reaches Claude from inside it
++      try {
++        const th = await msg.startThread({ name: mode.name || `thread from ${msg.author.username}`, autoArchiveDuration: 1440 })
++        chat_id = th.id
++        if (!mode.name) newThreads.add(th.id)
++        void msg.react('🧵').catch(() => {})
++      } catch {}
++    }
++  }
++
++  // laris-co patch: "!here" / "!lock" (see hereCommand).
++  if (msg.channel.type !== ChannelType.DM) {
++    const cmd = hereCommand(msg, result.access)
++    if (cmd?.kind === 'lock') {
++      unlocked.delete(msg.channelId)
++      void msg.react('🔒').catch(() => {})
++      return
++    }
++    if (cmd?.kind === 'unlock') {
++      unlocked.set(msg.channelId, { until: Date.now() + cmd.idleMs, idleMs: cmd.idleMs })
++      void msg.react('🔓').catch(() => {})
++    }
++  }
++
++  // laris-co patch: a tag in a plain channel moves the conversation into a thread,
++  // unless the room is unlocked with "!here".
++  if (msg.channel.type !== ChannelType.DM && !msg.channel.isThread() && !isUnlocked(msg.channelId)) {
++    const policy = findGroupPolicy(result.access, msg.channel)
++    if (threadMode(msg.channelId, policy) && await isMentioned(msg, result.access.mentionPatterns)) {
++      const threadId = await threadFor(msg)
++      if (threadId) chat_id = threadId
++    }
++  }
+ 
+   if (msg.channel.type === ChannelType.DM) {
+     dmChannelUsers.set(chat_id, msg.author.id)
+@@ -868,6 +1287,12 @@
+     atts.push(`${safeAttName(att)} (${att.contentType ?? 'unknown'}, ${kb}KB)`)
+   }
+ 
++  // laris-co patch: a tag brings the room's recent talk with it.
++  const backfillN = tagged ? (roomPolicy?.historyBackfill ?? 0) : 0
++  const context = backfillN > 0
++    ? await historyBackfill(msg, backfillN, [...(roomPolicy?.allowFrom ?? []), ...result.access.allowFrom])
++    : ''
++
+   // Attachment listing goes in meta only — an in-content annotation is
+   // forgeable by any allowlisted sender typing that string.
+   const content = msg.content || (atts.length > 0 ? '(attachment)' : '')
+@@ -882,6 +1307,9 @@
+         user: msg.author.username,
+         user_id: msg.author.id,
+         ts: msg.createdAt.toISOString(),
++        ...(msg.channel.type !== ChannelType.DM ? { tagged: tagged ? 'true' : 'false' } : {}),
++        ...(context ? { context } : {}),
++        ...(newThreads.has(chat_id) ? { thread_new: 'true: name it with rename_thread once you know the topic' } : {}),
+         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
+       },
+     },
