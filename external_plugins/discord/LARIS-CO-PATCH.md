@@ -65,8 +65,21 @@ a prior hand patch it knows about, or already ours. Anything else it leaves alon
 - **Roll call in a thread joins it.** A role tag (All Oracles or a team role) inside a thread makes every awake
   bot holding that role join the thread. After that, every message there from an `allowFrom` user reaches those
   bots without a tag. `!leave` in the thread makes every bot leave, and `!kick @Bot [@Bot…]` makes only the tagged bots leave
-  (each one reacts 👋). Joined threads are saved in
+  (each one reacts 👋). `!kick @some-role` makes every bot holding that role leave, and `!join @some-role` brings
+  them back; a kick is checked before the roll call, so its role tag does not pull them back in. Joined threads are saved in
   `<state dir>/joined.json`, so they survive restarts.
+- **`!!summon @Bot [@Bot…]`** (or plain `summon @Bot`): a trusted human calls the tagged bots into a conversation.
+  In a thread, each tagged bot joins it. In a room, they share one thread named after them: each bot's server name
+  as a slug (`Some Bot` → `some-bot`, two bots → `bot-a + bot-b`). If the room already has an unlocked thread with
+  that name, it is reused and unarchived, and the first tagged bot links it; otherwise the thread opens on the message.
+  Only the human who summoned is added. `summonRooms: [<channel id>]` limits where summon works (elsewhere: 🚫).
+- A thread opened by a tag is named after the message text without the tags.
+- **Every message carries its place:** `channel="#room"`, plus `thread="name"` when it comes from a thread. The names
+  come from the channel objects discord.js already keeps for the gateway (renames update them): no API call, no timer.
+- **Forwarded rooms get attachments as local paths** the worktree body can read, since it cannot call
+  `download_attachment` itself.
+- **Allowlisted webhooks** (for example an uptime monitor posting alerts into a room) pass the bot filter when their
+  webhook id is in the room's `allowFrom`.
 - `deny: true` on a group means never listen there, even if the guild default would.
 - A thread can be allowed by its own id. This is the earlier hand patch from 2026-10-17 10:40, now folded in.
 

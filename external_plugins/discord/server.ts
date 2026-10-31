@@ -26,6 +26,7 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  cleanContent,
   type Message,
   type Attachment,
   type Interaction,
@@ -151,6 +152,8 @@ type Access = {
   /** laris-co patch: role ids that work as a roll call. A message from an allowFrom user that tags one of
    *  these roles reaches this bot in any room, even one its policy closes, and the bot may answer there. */
   roleCall?: string[]
+  /** laris-co patch: rooms where "!!summon" works (the room and its threads). Unset = everywhere. */
+  summonRooms?: string[]
   pending: Record<string, PendingEntry>
   mentionPatterns?: string[]
   // delivery/UX config — optional, defaults live in the reply handler
@@ -204,6 +207,7 @@ function readAccessFile(): Access {
       host: parsed.host,
       here: parsed.here,
       roleCall: parsed.roleCall,
+      summonRooms: parsed.summonRooms,
       pending: parsed.pending ?? {},
       mentionPatterns: parsed.mentionPatterns,
       ackReaction: parsed.ackReaction,
@@ -416,12 +420,18 @@ function findForwardTarget(herdr: string, target: string): { session: string; pa
   return null
 }
 
-function forwardToWorktree(msg: Message, policy: GroupPolicy, chatId: string): boolean {
+async function forwardToWorktree(msg: Message, policy: GroupPolicy, chatId: string): Promise<boolean> {
   const herdr = process.env.HERDR_BIN_PATH || 'herdr'
   const to = findForwardTarget(herdr, policy.forwardTo!)
   if (!to) return false
   const room = 'name' in msg.channel && msg.channel.name ? `#${msg.channel.name}` : chatId
-  const atts = msg.attachments.size ? ` (+${msg.attachments.size} attachment)` : ''
+  // laris-co patch (2026-10-30): a forwarded body cannot call download_attachment, so download here and pass
+  // local paths it can Read (a forwarded body used to get only "(+1 attachment)").
+  const paths: string[] = []
+  for (const att of msg.attachments.values()) {
+    try { paths.push(`${safeAttName(att)}: ${await downloadAttachment(att)}`) } catch (e) { paths.push(`${safeAttName(att)}: not downloaded (${e instanceof Error ? e.message : e})`) }
+  }
+  const atts = paths.length ? ` (attachments, Read these files: ${paths.join(' ; ')})` : ''
   const tag = policy.answerMention ? `<@${policy.answerMention}> ` : ''
   const say = policy.answerCmd ?? (policy.answerAs ? `BOT=${policy.answerAs} just say` : '')
   const as = say ? ` · answer: ${say} ${chatId} "${tag}<text>" (typing: ${say.replace(/discord-say\.sh$/, 'discord-say.sh --typing')} ${chatId})` : ''
@@ -465,7 +475,10 @@ function kickGate(msg: Message, access: Access): GateResult | null {
   const me = client.user.id
   const id = msg.channelId
   const human = access.allowFrom.includes(msg.author.id)
-  const aboutMe = msg.mentions.users.has(me)
+  // about this bot: it is tagged by name, or a role it holds is tagged (Nat 2026-10-31: "we should can kick the role?"),
+  // so "!kick @some-team" sends out every bot holding that role. Checked here, before the roll call, which would pull them back in.
+  const mine = msg.guild?.members.me?.roles.cache
+  const aboutMe = msg.mentions.users.has(me) || (!!mine && msg.mentions.roles.some(r => mine.has(r.id)))
   const text = msg.content.trim().toLowerCase()
   // a human removes this bot from the thread's member list (Discord posts a "removed X from the thread" message)
   if (human && aboutMe && msg.type === MessageType.RecipientRemove) {
@@ -503,8 +516,9 @@ function isRollCall(msg: Message, access: Access): boolean {
 
 // laris-co patch: open (or join) a thread on the triggering message and return its id.
 // Two bots tagged in one message race here; the loser finds the winner's thread.
-async function threadFor(msg: Message): Promise<string | null> {
-  const name = (msg.cleanContent || `${msg.author.username} asks`)
+// The name is the caller's, or the message text without the tags (2026-10-31: "@Some Bot !!summon" was a name).
+async function threadFor(msg: Message, name?: string): Promise<string | null> {
+  name ||= cleanContent(msg.content.replace(/<@[!&]?\d+>/g, ' '), msg.channel)
     .replace(/\s+/g, ' ').trim().slice(0, 90) || `${msg.author.username} asks`
   try {
     const thread = await msg.startThread({ name, autoArchiveDuration: 1440 })
@@ -519,6 +533,51 @@ async function threadFor(msg: Message): Promise<string | null> {
     }
     return null
   }
+}
+
+// laris-co patch (Nat 2026-10-31: "it should only like oracle name"): a summon thread is named after the summoned bots,
+// never after the message. Each tagged bot's server name as a slug ("Some Bot" -> some-bot, a nick
+// "Other Bot" -> other-bot), sorted and joined with " + ", so every bot in a race computes the same name.
+function summonBots(msg: Message): string[] {
+  return [...msg.mentions.users.values()].filter(u => u.bot).map(u => u.id).sort()
+}
+
+function summonName(msg: Message): string {
+  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  const names = summonBots(msg).map(id => {
+    const u = msg.mentions.users.get(id)!
+    return slug(msg.mentions.members?.get(id)?.displayName ?? u.globalName ?? u.username)
+  })
+  return [...new Set(names.filter(Boolean))].join(' + ').slice(0, 90)
+}
+
+// The room's thread that already carries this name (active, else archived and then unarchived), or null.
+// This is how a summon lands in the bot's own thread (some-bot) instead of a new one.
+// A locked thread was closed on purpose: it is skipped. Unarchiving an unlocked thread needs only Send Messages.
+async function namedThread(room: any, name: string): Promise<any | null> {
+  const want = name.toLowerCase()
+  const pick = (got: any) =>
+    [...(got?.threads?.values?.() ?? [])].find((t: any) => t.name?.toLowerCase() === want && !t.locked) ?? null
+  try {
+    const active = pick(await room.threads.fetchActive())
+    if (active) return active
+    const archived = pick(await room.threads.fetchArchived({ type: 'public', limit: 100 }))
+    if (archived) await archived.setArchived(false).catch(() => {})
+    return archived
+  } catch {
+    return null
+  }
+}
+
+// laris-co patch (Nat 2026-10-31: "the channel know where from channel name? ... i dont want to make memory leak"):
+// every message carries the room's name, and the thread's when it comes from one. Read from the channel object
+// discord.js already holds for the gateway (a rename arrives as CHANNEL_UPDATE / THREAD_UPDATE and updates it):
+// no API call, no timer, no cache of our own. A channel that is not in the cache just gets no name.
+function where(chatId: string): Record<string, string> {
+  const ch: any = client.channels.cache.get(chatId)
+  if (!ch || ch.type === ChannelType.DM) return {}
+  if (ch.isThread?.()) return { channel: `#${ch.parent?.name ?? ch.parentId}`, thread: String(ch.name) }
+  return { channel: `#${ch.name}` }
 }
 
 async function gate(msg: Message): Promise<GateResult> {
@@ -1143,8 +1202,18 @@ client.on('interactionCreate', async (interaction: Interaction) => {
     .catch(() => {})
 })
 
+// laris-co patch (2026-10-30): a webhook post (an uptime monitor -> a room) is a "bot" message too and used to be
+// dropped here. Let it through only when that webhook's id (= msg.author.id) is listed in the room's (or global)
+// allowFrom; gate() checks the same list again. Every other bot message is still dropped.
+function webhookAllowed(msg: Message): boolean {
+  if (!msg.webhookId || msg.channel.type === ChannelType.DM) return false
+  const access = loadAccess()
+  const policy = findGroupPolicy(access, msg.channel as any)
+  return [...(access.allowFrom ?? []), ...(policy?.allowFrom ?? [])].includes(msg.author.id)
+}
+
 client.on('messageCreate', msg => {
-  if (msg.author.bot) return
+  if (msg.author.bot && !webhookAllowed(msg)) return
   handleInbound(msg).catch(e => process.stderr.write(`discord: handleInbound failed: ${e}\n`))
 })
 
@@ -1173,12 +1242,49 @@ async function handleInbound(msg: Message): Promise<void> {
   // laris-co patch: rooms owned by a worktree body go there, not here.
   if (msg.channel.type !== ChannelType.DM) {
     const owner = findGroupPolicy(result.access, msg.channel)
-    if (owner?.forwardTo && forwardToWorktree(msg, owner, msg.channelId)) {
+    if (owner?.forwardTo && await forwardToWorktree(msg, owner, msg.channelId)) {
       void msg.react('📨').catch(() => {})
       // the worktree body is thinking now: show typing in the room (~10s; it can renew with `just typing`)
       if ('sendTyping' in msg.channel) void msg.channel.sendTyping().catch(() => {})
       return
     }
+  }
+
+  // laris-co patch (Nat 2026-10-30: "make tag oracle then !!summon"): "!!summon @Bot [@Bot…] [topic]" (or plain "summon",
+  // Nat: "can we support summon and !!summon") calls the tagged
+  // bots into a conversation. In a thread: each tagged bot joins it (hears every message, no tag, until !leave/!kick).
+  // In a room: the tagged bots share ONE thread named after them (summonName: "some-bot", "bot-a + bot-b").
+  // If the room already has a thread of that name it is reused and unarchived (Nat 2026-10-31); else one opens on the
+  // message (threadFor: the first wins, the rest find it). They join it and add only the human who summoned.
+  // Untagged bots, the host included, ignore it, so "!!summon" never becomes a thread named "summon".
+  if (msg.channel.type !== ChannelType.DM && /^(?:!!)?summon\b/i.test(msg.content.replace(/<@[!&]?\d+>/g, ' ').trim())) {
+    const me = client.user?.id
+    if (!me || !msg.mentions.users.has(me) || !result.access.allowFrom.includes(msg.author.id)) return
+    // only in the summon rooms (Nat 2026-10-30): the room itself or one of its threads
+    const rooms = result.access.summonRooms
+    const room = msg.channel.isThread() ? (msg.channel as any).parentId : msg.channelId
+    if (rooms?.length && !rooms.includes(room)) { void msg.react('🚫').catch(() => {}); return }
+    let tid: string | null = msg.channel.isThread() ? msg.channelId : null
+    let reused = false
+    if (!tid) {
+      const name = summonName(msg)
+      const old = name ? await namedThread(msg.channel, name) : null
+      reused = !!old && old.id !== msg.id     // a thread started on this message (a racing bot's) has the message's id
+      tid = old?.id ?? await threadFor(msg, name)
+    }
+    if (!tid) { void msg.react('⚠️').catch(() => {}); return }
+    // a reused thread is not attached to the message: point to it, once (the first tagged bot replies)
+    if (reused && summonBots(msg)[0] === me) {
+      void msg.reply({ content: `🧵 <#${tid}>`, allowedMentions: { parse: [] } }).catch(() => {})
+    }
+    setKicked(tid, false); setJoined(tid, true)
+    const th: any = await client.channels.fetch(tid).catch(() => null)
+    await th?.join?.().catch(() => {})
+    // only the human who summoned is added (Nat 2026-10-30: "who summon should tag add only that human")
+    if (th && !msg.channel.isThread()) await th.members?.add?.(msg.author.id).catch(() => {})
+    void msg.react('👋').catch(() => {})
+    void th?.send?.({ content: `👋 here (summoned by <@${msg.author.id}>)`, allowedMentions: { parse: [] } }).catch(() => {})
+    return
   }
 
   // laris-co patch: "!!<name>" (or "!!thread <name>") = a standalone public thread in this channel (in the parent when typed
@@ -1308,6 +1414,7 @@ async function handleInbound(msg: Message): Promise<void> {
         user_id: msg.author.id,
         ts: msg.createdAt.toISOString(),
         ...(msg.channel.type !== ChannelType.DM ? { tagged: tagged ? 'true' : 'false' } : {}),
+        ...where(chat_id),
         ...(context ? { context } : {}),
         ...(newThreads.has(chat_id) ? { thread_new: 'true: name it with rename_thread once you know the topic' } : {}),
         ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: atts.join('; ') } : {}),
